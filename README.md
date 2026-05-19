@@ -6,6 +6,7 @@ colorTo: indigo
 sdk: docker
 app_port: 7860
 pinned: false
+license: mit
 ---
 
 # Fake Job Detector API
