@@ -11,7 +11,7 @@ from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 from scipy.sparse import hstack, csr_matrix
 
 # ============================================================
-# LOAD MODEL & VECTORIZER (sekali saat server start)
+# LOAD MODEL & VECTORIZER
 # ============================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -20,7 +20,6 @@ MODEL = joblib.load(os.path.join(BASE_DIR, "trained_model.pkl"))
 TFIDF = joblib.load(os.path.join(BASE_DIR, "tfidf_vectorizer.pkl"))
 print("Model loaded successfully!")
 
-# Hardcode engineered features — MATCH PERSIS dengan notebook
 NUMERIC_FEATURES = [
     "uppercase_count", "exclamation_count",
     "question_count", "word_count", "avg_word_length",
@@ -32,22 +31,45 @@ BINARY_FEATURES = [
     "has_salary_range", "has_company_logo", "telecommuting", "has_questions"
 ]
 
-ENGINEERED_FEATURES = NUMERIC_FEATURES + BINARY_FEATURES  # total 13
+ENGINEERED_FEATURES = NUMERIC_FEATURES + BINARY_FEATURES
 
 # ============================================================
-# DECISION THRESHOLD — KRUSIAL untuk fraud detection
+# RISK THRESHOLDS — 4 tier system
 # ============================================================
-# Notebook pakai F2-optimal threshold (lebih ke recall) atau F1-optimal,
-# yang biasanya di range 0.15-0.30, BUKAN 0.5 default.
-# Tune nilai ini sesuai feel:
-#   0.20 = sangat agresif flag fake (recall tinggi, banyak false positive)
-#   0.30 = agresif (rekomendasi untuk fraud detection)
-#   0.40 = sedang
-#   0.50 = default sklearn (terlalu konservatif untuk fraud)
-FAKE_THRESHOLD = 0.30
+HIGH_RISK_THRESHOLD   = 0.70  # >=70% fake_prob = HIGH RISK
+MEDIUM_RISK_THRESHOLD = 0.40  # 40-70% = MEDIUM RISK
+LOW_RISK_THRESHOLD    = 0.20  # 20-40% = LOW RISK
+                              # <20% = LIKELY LEGITIMATE
+
+def get_risk_level(fake_prob: float) -> dict:
+    """Klasifikasi 4 tier berdasarkan fake probability."""
+    if fake_prob >= HIGH_RISK_THRESHOLD:
+        return {
+            "level": "HIGH_RISK",
+            "label": "High Risk",
+            "message": "Strong indicators of fraud detected"
+        }
+    elif fake_prob >= MEDIUM_RISK_THRESHOLD:
+        return {
+            "level": "MEDIUM_RISK",
+            "label": "Medium Risk",
+            "message": "Several warning signs identified — verify carefully before applying"
+        }
+    elif fake_prob >= LOW_RISK_THRESHOLD:
+        return {
+            "level": "LOW_RISK",
+            "label": "Low Risk",
+            "message": "Some unusual patterns detected — review with caution"
+        }
+    else:
+        return {
+            "level": "LIKELY_LEGITIMATE",
+            "label": "Likely Legitimate",
+            "message": "Pattern consistent with legitimate job postings"
+        }
 
 # ============================================================
-# PREPROCESSING (sama persis dengan notebook cell 33 & 37)
+# PREPROCESSING (match notebook)
 # ============================================================
 CUSTOM_STOPWORDS = {
     "experience", "work", "working", "team", "job", "jobs", "skills", "skill",
@@ -59,7 +81,6 @@ CUSTOM_STOPWORDS = {
 ALL_STOPWORDS = ENGLISH_STOP_WORDS.union(CUSTOM_STOPWORDS)
 
 def clean_text(text: str) -> str:
-    """SAMA PERSIS dengan notebook cell 33."""
     text = str(text).lower()
     text = text.encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"http\S+|www\.\S+", "", text)
@@ -73,14 +94,9 @@ def remove_stopwords(text: str) -> str:
     return " ".join(w for w in text.split() if w not in ALL_STOPWORDS)
 
 def extract_features(raw_text: str, cleaned: str) -> dict:
-    """
-    MATCH PERSIS dengan notebook cell 129 (predict_job_posting):
-    - Numeric features dihitung dari raw_text & cleaned
-    - Binary features SEMUA DI-SET 0 (sesuai notebook inference)
-    """
+    """Match notebook inference: numeric dari teks, binary = 0."""
     raw_words = raw_text.split()
     clean_words = cleaned.split()
-
     return {
         "uppercase_count":   sum(c.isupper() for c in raw_text),
         "exclamation_count": raw_text.count("!"),
@@ -100,7 +116,7 @@ def extract_features(raw_text: str, cleaned: str) -> dict:
 # ============================================================
 # FASTAPI APP
 # ============================================================
-app = FastAPI(title="Fake Job Detector API", version="3.0")
+app = FastAPI(title="Fake Job Detector API", version="4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -114,9 +130,11 @@ class JobInput(BaseModel):
     text: str = Field(..., min_length=50, description="Full job posting text")
 
 class PredictionOutput(BaseModel):
-    prediction: str
-    confidence: float
-    probabilities: dict
+    risk_level: str           # HIGH_RISK / MEDIUM_RISK / LOW_RISK / LIKELY_LEGITIMATE
+    risk_label: str           # "High Risk" / "Medium Risk" / ...
+    risk_message: str         # pesan lengkap untuk user
+    fake_probability: float   # 0.0 - 1.0
+    real_probability: float   # 0.0 - 1.0
     flags: list[str]
 
 @app.get("/")
@@ -124,7 +142,11 @@ def root():
     return {
         "status": "ok",
         "message": "Fake Job Detector API is running",
-        "threshold": FAKE_THRESHOLD
+        "thresholds": {
+            "high_risk":   HIGH_RISK_THRESHOLD,
+            "medium_risk": MEDIUM_RISK_THRESHOLD,
+            "low_risk":    LOW_RISK_THRESHOLD,
+        }
     }
 
 @app.post("/predict", response_model=PredictionOutput)
@@ -156,16 +178,15 @@ def predict(job: JobInput):
             fake_prob = 1.0 if pred == 1 else 0.0
             real_prob = 1.0 - fake_prob
 
-        if fake_prob >= FAKE_THRESHOLD:
-            pred_class = 1
-            confidence = fake_prob
-        else:
-            pred_class = 0
-            confidence = real_prob
+        # Risk classification
+        risk = get_risk_level(fake_prob)
 
+        # Build context-aware flags
         flags = []
         text_lower = job.text.lower()
-        if pred_class == 1:
+        is_suspicious = risk["level"] in ("HIGH_RISK", "MEDIUM_RISK", "LOW_RISK")
+
+        if is_suspicious:
             if any(w in text_lower for w in ["earn", "income", "from home", "easy money", "no experience"]):
                 flags.append("Suspicious compensation or work-from-home language")
             if features["exclamation_count"] > 3:
@@ -174,8 +195,10 @@ def predict(job: JobInput):
                 flags.append("Unusually short job description")
             if features["uppercase_count"] > 50:
                 flags.append("Heavy use of UPPERCASE text")
-            if any(w in text_lower for w in ["bank", "wire transfer", "send money", "western union"]):
-                flags.append("Requests financial information")
+            if any(w in text_lower for w in ["bank", "wire transfer", "send money", "western union", "bank account details", "bank details"]):
+                flags.append("Requests financial or banking information")
+            if any(w in text_lower for w in ["limited spots", "apply now", "urgent", "immediate start", "act fast"]):
+                flags.append("Uses urgency tactics")
             if not flags:
                 flags.append("Pattern matches known fraudulent postings")
         else:
@@ -189,9 +212,11 @@ def predict(job: JobInput):
                 flags.append("Language patterns consistent with legitimate postings")
 
         return PredictionOutput(
-            prediction="FAKE" if pred_class == 1 else "REAL",
-            confidence=confidence,
-            probabilities={"real": real_prob, "fake": fake_prob},
+            risk_level=risk["level"],
+            risk_label=risk["label"],
+            risk_message=risk["message"],
+            fake_probability=fake_prob,
+            real_probability=real_prob,
             flags=flags
         )
     except Exception as e:
