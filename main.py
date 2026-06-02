@@ -20,8 +20,7 @@ MODEL = joblib.load(os.path.join(BASE_DIR, "trained_model.pkl"))
 TFIDF = joblib.load(os.path.join(BASE_DIR, "tfidf_vectorizer.pkl"))
 print("Model loaded successfully!")
 
-# Hardcode engineered features (sama persis dengan notebook)
-# URUTAN INI TIDAK BOLEH DIUBAH — match dengan training (total 13 features)
+# Hardcode engineered features — MATCH PERSIS dengan notebook
 NUMERIC_FEATURES = [
     "uppercase_count", "exclamation_count",
     "question_count", "word_count", "avg_word_length",
@@ -33,10 +32,22 @@ BINARY_FEATURES = [
     "has_salary_range", "has_company_logo", "telecommuting", "has_questions"
 ]
 
-ENGINEERED_FEATURES = NUMERIC_FEATURES + BINARY_FEATURES  # 13 total
+ENGINEERED_FEATURES = NUMERIC_FEATURES + BINARY_FEATURES  # total 13
 
 # ============================================================
-# PREPROCESSING (sama persis dengan notebook)
+# DECISION THRESHOLD — KRUSIAL untuk fraud detection
+# ============================================================
+# Notebook pakai F2-optimal threshold (lebih ke recall) atau F1-optimal,
+# yang biasanya di range 0.15-0.30, BUKAN 0.5 default.
+# Tune nilai ini sesuai feel:
+#   0.20 = sangat agresif flag fake (recall tinggi, banyak false positive)
+#   0.30 = agresif (rekomendasi untuk fraud detection)
+#   0.40 = sedang
+#   0.50 = default sklearn (terlalu konservatif untuk fraud)
+FAKE_THRESHOLD = 0.30
+
+# ============================================================
+# PREPROCESSING (sama persis dengan notebook cell 33 & 37)
 # ============================================================
 CUSTOM_STOPWORDS = {
     "experience", "work", "working", "team", "job", "jobs", "skills", "skill",
@@ -48,8 +59,9 @@ CUSTOM_STOPWORDS = {
 ALL_STOPWORDS = ENGLISH_STOP_WORDS.union(CUSTOM_STOPWORDS)
 
 def clean_text(text: str) -> str:
-    """Sama persis dengan notebook cell preprocessing."""
-    text = text.lower()
+    """SAMA PERSIS dengan notebook cell 33."""
+    text = str(text).lower()
+    text = text.encode("ascii", "ignore").decode("ascii")
     text = re.sub(r"http\S+|www\.\S+", "", text)
     text = re.sub(r"<[^>]+>", "", text)
     text = re.sub(r"\d+", "", text)
@@ -60,15 +72,15 @@ def clean_text(text: str) -> str:
 def remove_stopwords(text: str) -> str:
     return " ".join(w for w in text.split() if w not in ALL_STOPWORDS)
 
-def extract_numeric_features(raw_text: str, clean_txt: str) -> dict:
+def extract_features(raw_text: str, cleaned: str) -> dict:
     """
-    Sama persis dengan notebook:
-    - uppercase, exclamation, question → dari full_text (raw)
-    - word_count, avg_word_length → dari clean_text
-    - raw_word_count → dari full_text sebelum cleaning
+    MATCH PERSIS dengan notebook cell 129 (predict_job_posting):
+    - Numeric features dihitung dari raw_text & cleaned
+    - Binary features SEMUA DI-SET 0 (sesuai notebook inference)
     """
     raw_words = raw_text.split()
-    clean_words = clean_txt.split()
+    clean_words = cleaned.split()
+
     return {
         "uppercase_count":   sum(c.isupper() for c in raw_text),
         "exclamation_count": raw_text.count("!"),
@@ -76,86 +88,19 @@ def extract_numeric_features(raw_text: str, clean_txt: str) -> dict:
         "word_count":        len(clean_words),
         "avg_word_length":   float(np.mean([len(w) for w in clean_words])) if clean_words else 0.0,
         "raw_word_count":    len(raw_words),
-    }
-
-def extract_binary_features(raw_text: str) -> dict:
-    """
-    7 binary features — di EMSCAD dataset asli adalah kolom terpisah.
-    Di production, user cuma paste teks, jadi kita generate heuristic dari konten teks.
-    """
-    text_lower = raw_text.lower()
-
-    # has_company_profile: punya deskripsi tentang perusahaan
-    company_keywords = [
-        "about us", "our company", "we are", "founded in", "headquartered",
-        "mission", "vision", "our team", "company overview"
-    ]
-    has_company_profile = int(any(kw in text_lower for kw in company_keywords))
-
-    # has_requirements: punya section requirements/qualifications
-    req_keywords = [
-        "requirement", "qualification", "must have", "required",
-        "bachelor", "degree", "years of experience", "minimum",
-        "skills needed", "you have", "you should"
-    ]
-    has_requirements = int(any(kw in text_lower for kw in req_keywords))
-
-    # has_benefits: ada pembahasan benefits/perks
-    benefit_keywords = [
-        "benefit", "insurance", "health care", "healthcare", "401k",
-        "pto", "paid time off", "vacation", "stock option", "equity",
-        "bonus", "compensation", "perks"
-    ]
-    has_benefits = int(any(kw in text_lower for kw in benefit_keywords))
-
-    # has_salary_range: ada angka mata uang / range gaji
-    salary_pattern = re.compile(
-        r"\$\s?\d+[,\d]*"            # $50,000, $5000
-        r"|\bIDR\s?\d+"              # IDR 5000000
-        r"|\bRp\s?\d+"               # Rp 5000000
-        r"|\bUSD\s?\d+"              # USD 5000
-        r"|\d+\s?k\s?(usd|/yr|per)"  # 50k usd, 50k/yr
-        r"|\bsalary[:\s]+\$?\d"      # salary: $50000, salary 50000
-        , re.IGNORECASE
-    )
-    has_salary_range = int(bool(salary_pattern.search(raw_text)))
-
-    # has_company_logo: ga bisa dideteksi dari teks pure
-    # Default 1 (asumsi posting "lengkap" punya logo di originalnya)
-    has_company_logo = 1
-
-    # telecommuting: posting mention remote/WFH
-    telecommuting_keywords = [
-        "remote", "work from home", "wfh", "telecommute", "telework",
-        "work anywhere", "distributed team", "fully remote"
-    ]
-    telecommuting = int(any(kw in text_lower for kw in telecommuting_keywords))
-
-    # has_questions: ada screening question / pertanyaan ke applicant
-    question_keywords = [
-        "why do you", "tell us about", "what makes you", "describe a time",
-        "screening question", "answer the following"
-    ]
-    # Atau ada banyak tanda tanya (>2 kemungkinan ada list pertanyaan)
-    has_questions = int(
-        any(kw in text_lower for kw in question_keywords)
-        or raw_text.count("?") > 2
-    )
-
-    return {
-        "has_company_profile": has_company_profile,
-        "has_requirements":    has_requirements,
-        "has_benefits":        has_benefits,
-        "has_salary_range":    has_salary_range,
-        "has_company_logo":    has_company_logo,
-        "telecommuting":       telecommuting,
-        "has_questions":       has_questions,
+        "has_company_profile": 0,
+        "has_requirements":    0,
+        "has_benefits":        0,
+        "has_salary_range":    0,
+        "has_company_logo":    0,
+        "telecommuting":       0,
+        "has_questions":       0,
     }
 
 # ============================================================
 # FASTAPI APP
 # ============================================================
-app = FastAPI(title="Fake Job Detector API", version="2.0")
+app = FastAPI(title="Fake Job Detector API", version="3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -176,71 +121,77 @@ class PredictionOutput(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "ok", "message": "Fake Job Detector API is running"}
+    return {
+        "status": "ok",
+        "message": "Fake Job Detector API is running",
+        "threshold": FAKE_THRESHOLD
+    }
 
 @app.post("/predict", response_model=PredictionOutput)
 def predict(job: JobInput):
     try:
-        # 1. Clean text
         cleaned = clean_text(job.text)
         cleaned = remove_stopwords(cleaned)
 
-        # 2. TF-IDF transform
         tfidf_vec = TFIDF.transform([cleaned])
 
-        # 3. Engineered features
-        numeric = extract_numeric_features(job.text, cleaned)
-        binary = extract_binary_features(job.text)
-        all_features = {**numeric, **binary}
-
-        # Susun feature vector sesuai urutan ENGINEERED_FEATURES
+        features = extract_features(job.text, cleaned)
         eng_vec = np.array(
-            [[all_features[f] for f in ENGINEERED_FEATURES]],
+            [[features[f] for f in ENGINEERED_FEATURES]],
             dtype=np.float64
         )
 
-        # 4. Gabung TF-IDF + engineered (total: 5000 + 13 = 5013)
         X = hstack([tfidf_vec, csr_matrix(eng_vec)])
 
-        # 5. Predict
-        proba = MODEL.predict_proba(X)[0]
-        pred_class = int(np.argmax(proba))
-        confidence = float(proba[pred_class])
+        if hasattr(MODEL, "predict_proba"):
+            proba = MODEL.predict_proba(X)[0]
+            fake_prob = float(proba[1])
+            real_prob = float(proba[0])
+        elif hasattr(MODEL, "decision_function"):
+            score = MODEL.decision_function(X)[0]
+            fake_prob = float(1 / (1 + np.exp(-score)))
+            real_prob = 1.0 - fake_prob
+        else:
+            pred = int(MODEL.predict(X)[0])
+            fake_prob = 1.0 if pred == 1 else 0.0
+            real_prob = 1.0 - fake_prob
 
-        # 6. Build flags untuk UI
+        if fake_prob >= FAKE_THRESHOLD:
+            pred_class = 1
+            confidence = fake_prob
+        else:
+            pred_class = 0
+            confidence = real_prob
+
         flags = []
         text_lower = job.text.lower()
-        if pred_class == 1:  # FAKE
+        if pred_class == 1:
             if any(w in text_lower for w in ["earn", "income", "from home", "easy money", "no experience"]):
                 flags.append("Suspicious compensation or work-from-home language")
-            if numeric["exclamation_count"] > 3:
-                flags.append(f"Excessive exclamation marks ({numeric['exclamation_count']} found)")
-            if numeric["word_count"] < 80:
+            if features["exclamation_count"] > 3:
+                flags.append(f"Excessive exclamation marks ({features['exclamation_count']} found)")
+            if features["word_count"] < 80:
                 flags.append("Unusually short job description")
-            if numeric["uppercase_count"] > 50:
+            if features["uppercase_count"] > 50:
                 flags.append("Heavy use of UPPERCASE text")
-            if not binary["has_requirements"]:
-                flags.append("Missing clear job requirements")
-            if not binary["has_company_profile"]:
-                flags.append("No company background information")
+            if any(w in text_lower for w in ["bank", "wire transfer", "send money", "western union"]):
+                flags.append("Requests financial information")
             if not flags:
                 flags.append("Pattern matches known fraudulent postings")
-        else:  # REAL
-            if numeric["word_count"] > 200:
+        else:
+            if features["word_count"] > 200:
                 flags.append("Detailed and comprehensive description")
-            if binary["has_requirements"]:
+            if any(w in text_lower for w in ["bachelor", "degree", "years experience", "qualifications"]):
                 flags.append("Specific qualification requirements listed")
-            if binary["has_benefits"]:
-                flags.append("Benefits and compensation clearly stated")
-            if binary["has_company_profile"]:
-                flags.append("Company background information provided")
+            if any(w in text_lower for w in ["responsibilities", "requirements", "benefits"]):
+                flags.append("Structured posting with clear sections")
             if not flags:
                 flags.append("Language patterns consistent with legitimate postings")
 
         return PredictionOutput(
             prediction="FAKE" if pred_class == 1 else "REAL",
             confidence=confidence,
-            probabilities={"real": float(proba[0]), "fake": float(proba[1])},
+            probabilities={"real": real_prob, "fake": fake_prob},
             flags=flags
         )
     except Exception as e:
